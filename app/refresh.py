@@ -31,6 +31,7 @@ class RefreshGrant:
     role: str
     family: str
     expires_at: int
+    session_version: int = 0
 
 
 class RefreshTokenStore:
@@ -61,15 +62,36 @@ class RefreshTokenStore:
     def _family_key(self, family: str) -> str:
         return f"fastapi-security-baseline:refresh-family:{family}"
 
-    async def issue(self, subject: str, role: str, family: str | None = None) -> tuple[str, RefreshGrant]:
+    async def issue(
+        self,
+        subject: str,
+        role: str,
+        family: str | None = None,
+        session_version: int = 0,
+    ) -> tuple[str, RefreshGrant]:
         raw = secrets.token_urlsafe(48)
-        grant = RefreshGrant(subject, role, family or str(uuid4()), int(time.time()) + self.settings.refresh_token_days * 86400)
+        grant = RefreshGrant(
+            subject,
+            role,
+            family or str(uuid4()),
+            int(time.time()) + self.settings.refresh_token_days * 86400,
+            session_version,
+        )
         digest = self._digest(raw)
         if self.using_memory:
             self._memory[digest] = grant
             return raw, grant
         try:
-            await self._ensure_client().hset(self._key(digest), mapping={"sub": subject, "role": role, "family": grant.family, "exp": grant.expires_at})
+            await self._ensure_client().hset(
+                self._key(digest),
+                mapping={
+                    "sub": subject,
+                    "role": role,
+                    "family": grant.family,
+                    "exp": grant.expires_at,
+                    "sv": grant.session_version,
+                },
+            )
             await self._ensure_client().expireat(self._key(digest), grant.expires_at)
             return raw, grant
         except Exception as exc:
@@ -93,7 +115,7 @@ class RefreshTokenStore:
                 raise RefreshTokenReuse("Refresh token is invalid or expired")
             self._used.add(digest)
             self._used_families[digest] = grant.family
-            return await self.issue(grant.subject, grant.role, grant.family)
+            return await self.issue(grant.subject, grant.role, grant.family, grant.session_version)
         client = self._ensure_client()
         try:
             key = self._key(digest)
@@ -104,10 +126,16 @@ class RefreshTokenStore:
                 raise RefreshTokenReuse("Refresh token is invalid or already used")
             if await client.exists(self._family_key(values["family"])):
                 raise RefreshTokenReuse("Refresh token family is revoked")
-            grant = RefreshGrant(values["sub"], values["role"], values["family"], int(values["exp"]))
+            grant = RefreshGrant(
+                values["sub"],
+                values["role"],
+                values["family"],
+                int(values["exp"]),
+                int(values.get("sv", 0)),
+            )
             if grant.expires_at <= int(time.time()):
                 raise RefreshTokenReuse("Refresh token is expired")
-            return await self.issue(grant.subject, grant.role, grant.family)
+            return await self.issue(grant.subject, grant.role, grant.family, grant.session_version)
         except RefreshTokenReuse:
             raise
         except Exception as exc:

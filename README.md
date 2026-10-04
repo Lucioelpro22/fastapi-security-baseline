@@ -12,7 +12,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[test]'
 cp .env.example .env
-# Replace JWT_SECRET and ADMIN_PASSWORD with unique values.
+# Replace JWT_SECRET, MFA_ENCRYPTION_KEY, and ADMIN_PASSWORD with unique values.
 pytest
 uvicorn app.main:app --reload
 ```

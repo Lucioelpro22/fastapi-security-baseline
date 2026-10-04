@@ -1,8 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Added a dedicated `MFA_ENCRYPTION_KEY`; MFA TOTP data is no longer coupled to
+  JWT signing-key rotation.
+- MFA activation now increments the account session version and invalidates
+  existing access and refresh sessions.
+
 All notable changes to this project are documented here. Versions before
 v0.4 were development milestones and should not be treated as production
 compatibility guarantees.
+
+## [Unreleased]
+
+Changes for the next release will be documented here.
 
 ## [0.4.0] - 2026-10-04
 
@@ -56,3 +67,5 @@ compatibility guarantees.
 - Added SQLAlchemy-backed users, Redis login rate limiting, RBAC, and production
   configuration validation.
 
+[Unreleased]: https://github.com/Lucioelpro22/fastapi-security-baseline/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Lucioelpro22/fastapi-security-baseline/releases/tag/v0.4.0

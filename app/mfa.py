@@ -12,6 +12,12 @@ from .security import hash_password, verify_password
 
 
 def _cipher(settings: Settings) -> Fernet:
+    if settings.mfa_encryption_key is not None:
+        return Fernet(settings.mfa_encryption_key.get_secret_value())
+    if settings.environment == "production":
+        raise RuntimeError("MFA_ENCRYPTION_KEY is required for MFA in production")
+    # Migration compatibility for records created before v0.5. New records
+    # are always written with MFA_ENCRYPTION_KEY when it is configured.
     digest = hashlib.sha256(settings.jwt_secret.get_secret_value().encode()).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
 
@@ -24,6 +30,15 @@ def decrypt_secret(value: str, settings: Settings) -> str | None:
     try:
         return _cipher(settings).decrypt(value.encode()).decode()
     except (InvalidToken, ValueError, UnicodeDecodeError):
+        # During migration, try the legacy JWT-derived key after the dedicated
+        # key. This path is intentionally unavailable in production without a
+        # dedicated key because _cipher fails closed there.
+        if settings.mfa_encryption_key is None and settings.environment != "production":
+            digest = hashlib.sha256(settings.jwt_secret.get_secret_value().encode()).digest()
+            try:
+                return Fernet(base64.urlsafe_b64encode(digest)).decrypt(value.encode()).decode()
+            except (InvalidToken, ValueError, UnicodeDecodeError):
+                pass
         return None
 
 

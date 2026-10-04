@@ -3,12 +3,26 @@ from __future__ import annotations
 
 import math
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
 from .redis import create_redis_client
+
+# Keep increment and expiry in one Redis-side operation.  A client-side
+# INCR followed by EXPIRE has a failure window where a counter can survive
+# forever if the process is interrupted between the two commands.
+_ATOMIC_INCREMENT_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+"""
 
 
 @dataclass(frozen=True)
@@ -39,18 +53,20 @@ class RateLimiter:
     async def _redis_check(self, key: str) -> LimitDecision:
         window = int(time.time() // self._window_seconds)
         redis_key = f"fastapi-security-baseline:ratelimit:{key}:{window}"
-        # Set expiry only on the first hit so later requests cannot extend the
-        # fixed window indefinitely. Redis keeps the key bounded by this TTL.
-        pipe = self._redis.pipeline(transaction=True)
-        pipe.incr(redis_key)
-        result = await pipe.execute()
-        count = result[0]
-        if int(count) == 1:
-            await self._redis.expire(redis_key, self._window_seconds)
-        ttl = await self._redis.ttl(redis_key)
-        retry_after = max(1, int(ttl) if int(ttl) > 0 else self._window_seconds)
+        # The script sets expiry only when the key has no TTL, so requests do
+        # not extend a fixed window while still repairing a key accidentally
+        # created without expiry. Both operations execute atomically in Redis.
+        count, ttl = await self._redis.eval(
+            _ATOMIC_INCREMENT_SCRIPT,
+            1,
+            redis_key,
+            self._window_seconds,
+        )
+        count = int(count)
+        ttl = int(ttl)
+        retry_after = max(1, ttl if ttl > 0 else self._window_seconds)
         return LimitDecision(
-            allowed=int(count) <= self.settings.rate_limit_per_minute,
+            allowed=count <= self.settings.rate_limit_per_minute,
             retry_after=retry_after,
         )
 
@@ -76,3 +92,25 @@ class RateLimiter:
             # runs usable if Redis is stopped, while never doing this in prod.
             self._redis = None
             return await self.check(key)
+
+    async def check_many(self, keys: list[str] | tuple[str, ...]) -> LimitDecision:
+        """Apply the same limit to each dimension and fail on the first block.
+
+        Callers can combine independent dimensions (for example, client IP and
+        normalized username) so changing one dimension cannot bypass the
+        credential-attempt limit. Empty and duplicate keys are ignored.
+        """
+        seen: set[str] = set()
+        for key in keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            decision = await self.check(key)
+            if not decision.allowed:
+                return decision
+        return LimitDecision(True, self._window_seconds)
+
+
+def normalize_username(username: str) -> str:
+    """Canonicalize a login identifier before using it as a limiter key."""
+    return unicodedata.normalize("NFKC", username).strip().casefold()

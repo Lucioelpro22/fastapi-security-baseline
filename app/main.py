@@ -10,9 +10,8 @@ from pydantic import BaseModel, Field
 from .audit import audit_event
 from .config import Settings, get_settings
 from .db import get_session_factory, init_db
-from .limiter import RateLimiter
+from .limiter import RateLimiter, normalize_username
 from .mfa import (
-    consume_recovery_code,
     decrypt_secret,
     encrypt_secret,
     generate_recovery_codes,
@@ -115,8 +114,21 @@ async def rate_limit(request: Request, call_next):
         limiter = getattr(request.app.state, "rate_limiter", None)
         if limiter is None:
             limiter = request.app.state.rate_limiter = RateLimiter(settings)
-        key = request.client.host if request.client else "unknown"
-        decision = await limiter.check(key)
+        client_ip = request.client.host if request.client else "unknown"
+        # Read only the username field needed for the second limiter
+        # dimension. Request.body() is cached by Starlette for downstream
+        # validation; passwords and other fields never enter limiter keys.
+        username = ""
+        try:
+            payload = json.loads((await request.body()).decode("utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("username"), str):
+                username = normalize_username(payload["username"])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        keys = [f"ip:{client_ip}"]
+        if username:
+            keys.append(f"username:{username}")
+        decision = await limiter.check_many(keys)
         if not decision.allowed:
             if decision.unavailable:
                 return JSONResponse(
@@ -178,13 +190,8 @@ async def token(request: Request, body: TokenRequest, settings: Settings = Depen
         code_valid = bool(secret and body.totp_code and valid_code(secret, body.totp_code))
         recovery_used = False
         if not code_valid and body.recovery_code:
-            recovery_used, remaining = consume_recovery_code(user.recovery_codes_hashes, body.recovery_code)
-            if recovery_used:
-                with get_session_factory()() as session:
-                    persisted = UserRepository(session).get_by_id(user.id)
-                    if persisted:
-                        persisted.recovery_codes_hashes = remaining
-                        session.commit()
+            with get_session_factory()() as session:
+                recovery_used = UserRepository(session).consume_recovery_code(user.id, body.recovery_code)
         if not code_valid and not recovery_used:
             audit_event("mfa_login", user.id, "failure", getattr(request.state, "request_id", None))
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MFA required")
@@ -192,9 +199,11 @@ async def token(request: Request, body: TokenRequest, settings: Settings = Depen
     refresh_store = getattr(request.app.state, "refresh_store", None)
     if refresh_store is None:
         refresh_store = request.app.state.refresh_store = RefreshTokenStore(settings)
-    refresh_token, _ = await refresh_store.issue(user.id, user.role)
+    refresh_token, _ = await refresh_store.issue(user.id, user.role, session_version=user.session_version)
     return {
-        "access_token": create_access_token(user.id, user.role, settings),
+        "access_token": create_access_token(
+            user.id, user.role, settings, session_version=user.session_version
+        ),
         "refresh_token": refresh_token,
         "token_type": "bearer",
     }
@@ -212,7 +221,23 @@ async def refresh(request: Request, body: RefreshRequest, settings: Settings = D
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RefreshTokenReuse as exc:
         raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
-    access = create_access_token(grant.subject, grant.role, settings)
+    # MFA activation and other credential changes advance the account session
+    # epoch. A stale refresh family is revoked before it can mint a token.
+    with get_session_factory()() as session:
+        account = UserRepository(session).get_by_id(grant.subject)
+        if account is not None and account.session_version != grant.session_version:
+            try:
+                await store.revoke_family(grant.family)
+            except RefreshStoreUnavailable as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise HTTPException(status_code=401, detail="Session expired; authenticate again")
+        current_session_version = account.session_version if account is not None else grant.session_version
+    access = create_access_token(
+        grant.subject,
+        grant.role,
+        settings,
+        session_version=current_session_version,
+    )
     return {"access_token": access, "refresh_token": new_refresh, "token_type": "bearer"}
 
 
@@ -300,6 +325,7 @@ def verify_mfa(body: MFACodeRequest, user: dict = Depends(require_roles(Role.ADM
         if account is None or not secret or account.mfa_enabled or not valid_code(secret, body.code):
             raise HTTPException(status_code=400, detail="Invalid MFA enrollment code")
         account.mfa_enabled = True
+        account.session_version += 1
         session.commit()
     audit_event("mfa_enabled", user["id"], "success")
     return {"status": "enabled"}

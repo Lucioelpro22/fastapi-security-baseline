@@ -8,6 +8,8 @@ from fastapi.security import OAuth2PasswordBearer
 from pwdlib import PasswordHash
 
 from .config import Settings, get_settings
+from .db import get_session_factory
+from .models import User
 from .revocation import RevocationStore, RevocationUnavailable
 
 password_hash = PasswordHash.recommended()
@@ -32,7 +34,12 @@ def verify_password(password: str, hashed: str) -> bool:
 
 
 def create_access_token(
-    subject: str, role: str | Role, settings: Settings, *, jti: str | None = None
+    subject: str,
+    role: str | Role,
+    settings: Settings,
+    *,
+    jti: str | None = None,
+    session_version: int = 0,
 ) -> str:
     now = datetime.now(UTC)
     payload = {
@@ -42,6 +49,7 @@ def create_access_token(
         "iss": settings.jwt_issuer,
         "aud": settings.jwt_audience,
         "jti": jti or str(uuid4()),
+        "sv": session_version,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }
@@ -98,12 +106,31 @@ async def current_user(
             or role not in {item.value for item in Role}
         ):
             raise credentials_error
+        token_session_version = payload.get("sv", 0)
+        if not isinstance(token_session_version, int) or token_session_version < 0:
+            raise credentials_error
+        # The user record is the authoritative session epoch. A change that
+        # requires re-authentication (currently MFA activation) increments it,
+        # invalidating all previously issued access tokens.
+        with get_session_factory()() as session:
+            account = session.get(User, subject)
+            # Keep compatibility with service-to-service subjects that are not
+            # represented in the local users table. Persisted users are always
+            # checked against the current session epoch.
+            if account is not None and (not account.is_active or account.session_version != token_session_version):
+                raise credentials_error
         store = getattr(request.app.state, "revocation_store", None)
         if store is None:
             store = request.app.state.revocation_store = RevocationStore(settings)
         if await store.is_revoked(jti):
             raise credentials_error
-        return {"id": subject, "role": role, "jti": jti, "exp": payload["exp"]}
+        return {
+            "id": subject,
+            "role": role,
+            "jti": jti,
+            "exp": payload["exp"],
+            "session_version": token_session_version,
+        }
     except RevocationUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except (jwt.PyJWTError, HTTPException) as exc:

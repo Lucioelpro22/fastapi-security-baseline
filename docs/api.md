@@ -45,6 +45,7 @@ Requires a valid token with the `admin` role. Other roles receive `403`.
 | --- | --- | --- |
 | `ENVIRONMENT` | No | `development`, `test`, or `production` |
 | `JWT_SECRET` | Yes | At least 32 unique characters |
+| `MFA_ENCRYPTION_KEY` | MFA in production | Fernet key used only to encrypt TOTP secrets; generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `JWT_ISSUER` / `JWT_AUDIENCE` | No | JWT scope checks |
 | `ADMIN_PASSWORD` | Production | Initial admin password, at least 16 characters |
 | `REDIS_URL` | Production | Distributed rate limiter backend |
@@ -55,6 +56,13 @@ Requires a valid token with the `admin` role. Other roles receive `403`.
 
 Never commit `.env` files or place credentials in the request payload beyond
 the login password. Use a managed secret store in production.
+
+`MFA_ENCRYPTION_KEY` is deliberately independent from `JWT_SECRET`. During a
+development migration, records written by older releases can still be read
+with the legacy JWT-derived key; newly encrypted records use the dedicated
+key. Production MFA operations fail closed unless the dedicated key is
+configured. Enabling MFA increments the account session version and invalidates
+all previously issued access and refresh sessions for that account.
 # WebAuthn / passkeys
 
 The baseline exposes two administrator-only integration points:

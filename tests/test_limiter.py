@@ -2,37 +2,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.limiter import RateLimiter
-
-
-class FakePipeline:
-    def __init__(self, redis):
-        self.redis = redis
-        self.commands = []
-
-    def incr(self, key):
-        self.commands.append(("incr", key))
-
-    async def execute(self):
-        key = self.commands[0][1]
-        self.redis.counts[key] = self.redis.counts.get(key, 0) + 1
-        return [self.redis.counts[key]]
+from app.limiter import RateLimiter, normalize_username
 
 
 class FakeRedis:
     def __init__(self):
         self.counts = {}
         self.expirations = {}
+        self.eval_calls = []
 
-    def pipeline(self, transaction=True):
-        return FakePipeline(self)
-
-    async def expire(self, key, seconds):
-        self.expirations[key] = seconds
-        return True
-
-    async def ttl(self, key):
-        return self.expirations.get(key, 60)
+    async def eval(self, script, numkeys, key, seconds):
+        self.eval_calls.append((script, numkeys, key, seconds))
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if key not in self.expirations:
+            self.expirations[key] = seconds
+        return [self.counts[key], self.expirations[key]]
 
 
 @pytest.mark.anyio
@@ -47,6 +31,29 @@ async def test_redis_limiter_sets_ttl_and_returns_429_decision():
     assert second.allowed is False
     assert second.retry_after == 60
     assert len(limiter._redis.expirations) == 1
+    assert len(limiter._redis.eval_calls) == 2
+    assert limiter._redis.eval_calls[0][1] == 1
+
+
+@pytest.mark.anyio
+async def test_redis_limiter_repairs_missing_ttl_without_extending_existing_window():
+    settings = SimpleNamespace(environment="production", redis_url="redis://test", rate_limit_per_minute=60)
+    redis = FakeRedis()
+    limiter = RateLimiter(settings, redis_client=redis)
+
+    first = await limiter.check("127.0.0.1")
+    redis_key = next(iter(redis.counts))
+    redis.expirations[redis_key] = 42
+    second = await limiter.check("127.0.0.1")
+
+    assert first.retry_after == 60
+    assert second.retry_after == 42
+    assert redis.expirations[redis_key] == 42
+
+    del redis.expirations[redis_key]
+    third = await limiter.check("127.0.0.1")
+    assert third.retry_after == 60
+    assert redis.expirations[redis_key] == 60
 
 
 @pytest.mark.anyio
@@ -60,3 +67,20 @@ async def test_production_redis_failure_fails_closed():
 
     assert decision.allowed is False
     assert decision.unavailable is True
+
+
+@pytest.mark.anyio
+async def test_combined_dimensions_prevent_ip_rotation_bypass():
+    settings = SimpleNamespace(environment="test", redis_url=None, rate_limit_per_minute=1)
+    limiter = RateLimiter(settings)
+
+    first = await limiter.check_many(["ip:198.51.100.10", "username:user@example.com"])
+    rotated_ip = await limiter.check_many(["ip:198.51.100.11", "username:user@example.com"])
+
+    assert first.allowed is True
+    assert rotated_ip.allowed is False
+
+
+def test_username_normalization_is_stable_for_limiter_keys():
+    assert normalize_username("  User@Example.COM ") == "user@example.com"
+    assert normalize_username("Ｕｓｅｒ@Ｅｘａｍｐｌｅ.ＣＯＭ") == "user@example.com"

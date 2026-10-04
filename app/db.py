@@ -56,6 +56,7 @@ def init_db(database_url: str | None = None) -> None:
         "mfa_secret_encrypted": "TEXT",
         "mfa_enabled": "BOOLEAN NOT NULL DEFAULT 0",
         "recovery_codes_hashes": "TEXT",
+        "session_version": "INTEGER NOT NULL DEFAULT 0",
     }
     with engine.begin() as connection:
         for name, definition in additions.items():

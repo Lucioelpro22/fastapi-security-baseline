@@ -1,14 +1,18 @@
 import os
 
 import pyotp
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 os.environ.setdefault("JWT_SECRET", "test-secret-that-is-long-enough-123456")
 os.environ.setdefault("ENVIRONMENT", "test")
 os.environ.setdefault("ADMIN_PASSWORD", "ChangeThisTestPassword!12345")
 
+from app.config import Settings
 from app.db import get_session_factory, init_db
 from app.main import app
+from app.mfa import decrypt_secret, encrypt_secret
 from app.models import User
 
 
@@ -39,6 +43,9 @@ def test_admin_totp_enrollment_login_and_one_time_recovery_code():
 
     code = pyotp.TOTP(data["secret"]).now()
     assert client.post("/auth/mfa/verify", headers=headers, json={"code": code}).status_code == 200
+    # Enabling MFA advances the account session epoch, so the token used for
+    # enrollment cannot continue to access protected resources.
+    assert client.get("/me", headers=headers).status_code == 401
     assert client.post("/auth/token", json={"username": "admin@example.com", "password": "ChangeThisTestPassword!12345"}).status_code == 401
     totp_login = client.post("/auth/token", json={"username": "admin@example.com", "password": "ChangeThisTestPassword!12345", "totp_code": pyotp.TOTP(data["secret"]).now()})
     assert totp_login.status_code == 200
@@ -53,6 +60,20 @@ def test_admin_totp_enrollment_login_and_one_time_recovery_code():
         admin.mfa_secret_encrypted = None
         admin.recovery_codes_hashes = None
         session.commit()
+
+
+def test_mfa_cipher_is_independent_from_jwt_secret():
+    key = Fernet.generate_key().decode()
+    first = Settings(jwt_secret=SecretStr("jwt-secret-that-is-long-enough-123456"), mfa_encryption_key=SecretStr(key))
+    second = Settings(jwt_secret=SecretStr("a-different-jwt-secret-long-enough-123456"), mfa_encryption_key=SecretStr(key))
+    value = encrypt_secret("totp-secret", first)
+    assert decrypt_secret(value, second) == "totp-secret"
+
+    other = Settings(
+        jwt_secret=SecretStr("a-different-jwt-secret-long-enough-123456"),
+        mfa_encryption_key=SecretStr(Fernet.generate_key().decode()),
+    )
+    assert decrypt_secret(value, other) is None
 
 
 def _stored_admin() -> dict:

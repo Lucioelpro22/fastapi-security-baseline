@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # during a rollout so already-issued access tokens can expire naturally.
     jwt_key_id: str = Field(default="default", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     jwt_previous_secrets: dict[str, SecretStr] = Field(default_factory=dict)
+    # Dedicated Fernet key for encrypting TOTP secrets. It is intentionally
+    # separate from JWT_SECRET so rotating signing keys cannot expose MFA data.
+    # Existing development databases can be read with the legacy JWT-derived
+    # key during migration; production MFA use requires this setting.
+    mfa_encryption_key: SecretStr | None = None
     admin_password: SecretStr | None = None
     access_token_minutes: int = Field(default=15, ge=5, le=60)
     refresh_token_days: int = Field(default=30, ge=1, le=365)
@@ -44,6 +49,19 @@ class Settings(BaseSettings):
             min_length=32,
             reject_demo=True,
         )
+        return value
+
+    @field_validator("mfa_encryption_key")
+    @classmethod
+    def validate_mfa_encryption_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return value
+        from cryptography.fernet import Fernet, InvalidToken
+
+        try:
+            Fernet(value.get_secret_value())
+        except (ValueError, InvalidToken) as exc:
+            raise ValueError("MFA_ENCRYPTION_KEY must be a valid Fernet key") from exc
         return value
 
     @field_validator("admin_password")
