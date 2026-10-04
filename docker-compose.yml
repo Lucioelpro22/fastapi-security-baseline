@@ -1,0 +1,32 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    ports: ["127.0.0.1:8000:8000"]
+    init: true
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 100
+    mem_limit: 512m
+    restart: unless-stopped
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    read_only: true
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 100
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

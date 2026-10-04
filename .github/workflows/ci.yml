@@ -1,0 +1,35 @@
+name: CI
+on: [push, pull_request]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install -e '.[test]' ruff pip-audit
+      - run: ruff check .
+      - run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=70
+      - run: python -m compileall -q app tests
+      - run: pip check
+      - name: Audit dependencies and write SBOM
+        run: pip-audit --format cyclonedx-json --output sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sbom-${{ github.sha }}
+          path: sbom.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Build container
+        run: docker build --pull --tag fastapi-security-baseline:${{ github.sha }} .
+      - name: Inspect container configuration
+        run: |
+          docker image inspect fastapi-security-baseline:${{ github.sha }} \
+            --format '{{json .Config.User}} {{json .Config.Healthcheck}}'
