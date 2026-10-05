@@ -1,8 +1,8 @@
-"""Opaque refresh-token rotation and reuse detection.
+"""Opaque refresh-token rotation with shared, atomic replay detection.
 
-Refresh values are never JWTs and are stored only as SHA-256 digests. The
-in-memory implementation supports development/tests; production requires the
-configured Redis backend so token state is shared across workers.
+Redis retains consumed-token digests until the original session expires. A
+replay revokes that entire family, including descendants issued by other
+workers. Rotation never extends the original session's absolute lifetime.
 """
 from __future__ import annotations
 
@@ -15,6 +15,54 @@ from uuid import uuid4
 
 from .config import Settings
 from .redis import close_redis, create_redis_client
+
+# Issuance and revocation must not interleave between checking a family and
+# storing a token. Only hashes are stored; raw bearer values never reach Redis.
+_ISSUE_SCRIPT = """
+if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+local expires = tonumber(ARGV[4])
+local bound = tonumber(redis.call('GET', KEYS[3]))
+if bound then expires = bound end
+if expires <= tonumber(redis.call('TIME')[1]) then return 0 end
+if not bound then redis.call('SET', KEYS[3], expires, 'EXAT', expires) end
+redis.call('HSET', KEYS[1], 'sub', ARGV[1], 'role', ARGV[2],
+           'family', ARGV[3], 'exp', expires, 'sv', ARGV[5])
+redis.call('EXPIREAT', KEYS[1], expires)
+return expires
+"""
+
+# One operation consumes the old token, retains its family/expiry as a
+# tombstone, and stores its successor. Another worker replaying the old token
+# then revokes the family through the same absolute expiry. A competing
+# descendant rotation either happens before revocation or observes it; no
+# descendant remains usable once the replay operation has completed.
+_ROTATE_SCRIPT = """
+local values = redis.call('HMGET', KEYS[1], 'sub', 'role', 'family', 'exp', 'sv', 'used')
+if not values[1] then return {} end
+local expires = tonumber(values[4])
+if not expires or expires <= tonumber(ARGV[2]) then return {} end
+local family_key = ARGV[1] .. values[3]
+local session_key = family_key .. ':expires'
+local bound = tonumber(redis.call('GET', session_key))
+if bound then expires = math.min(expires, bound) end
+if expires <= tonumber(ARGV[2]) then return {} end
+if not bound then redis.call('SET', session_key, expires, 'EXAT', expires) end
+if values[6] == '1' then
+    local ttl = redis.call('TTL', family_key)
+    if ttl ~= -1 then
+        if ttl >= 0 then expires = math.max(expires, tonumber(ARGV[2]) + ttl) end
+        redis.call('SET', family_key, '1', 'EXAT', expires)
+    end
+    return {}
+end
+if redis.call('EXISTS', family_key) == 1 then return {} end
+redis.call('HSET', KEYS[1], 'used', '1')
+redis.call('EXPIREAT', KEYS[1], expires)
+redis.call('HSET', KEYS[2], 'sub', values[1], 'role', values[2],
+           'family', values[3], 'exp', expires, 'sv', values[5] or '0')
+redis.call('EXPIREAT', KEYS[2], expires)
+return {values[1], values[2], values[3], tostring(expires), values[5] or '0'}
+"""
 
 
 class RefreshStoreUnavailable(RuntimeError):
@@ -39,9 +87,9 @@ class RefreshTokenStore:
         self.settings = settings
         self._redis = redis_client
         self._memory: dict[str, RefreshGrant] = {}
-        self._used: set[str] = set()
-        self._used_families: dict[str, str] = {}
+        self._used: dict[str, RefreshGrant] = {}
         self._families_revoked: set[str] = set()
+        self._family_expirations: dict[str, int] = {}
 
     @property
     def using_memory(self) -> bool:
@@ -68,36 +116,47 @@ class RefreshTokenStore:
         role: str,
         family: str | None = None,
         session_version: int = 0,
+        *,
+        expires_at: int | None = None,
     ) -> tuple[str, RefreshGrant]:
         raw = secrets.token_urlsafe(48)
+        deadline = int(time.time()) + self.settings.refresh_token_days * 86400
         grant = RefreshGrant(
             subject,
             role,
             family or str(uuid4()),
-            int(time.time()) + self.settings.refresh_token_days * 86400,
+            min(expires_at, deadline) if expires_at is not None else deadline,
             session_version,
         )
+        if grant.expires_at <= int(time.time()):
+            raise RefreshTokenReuse("Refresh token session is expired")
         digest = self._digest(raw)
         if self.using_memory:
+            if grant.family in self._families_revoked:
+                raise RefreshTokenReuse("Refresh token family is revoked")
+            bound = self._family_expirations.setdefault(grant.family, grant.expires_at)
+            grant = RefreshGrant(subject, role, grant.family, bound, session_version)
+            if grant.expires_at <= int(time.time()):
+                raise RefreshTokenReuse("Refresh token session is expired")
             self._memory[digest] = grant
             return raw, grant
         try:
-            await self._ensure_client().hset(
-                self._key(digest),
-                mapping={
-                    "sub": subject,
-                    "role": role,
-                    "family": grant.family,
-                    "exp": grant.expires_at,
-                    "sv": grant.session_version,
-                },
+            issued = await self._ensure_client().eval(
+                _ISSUE_SCRIPT, 3, self._key(digest), self._family_key(grant.family),
+                self._family_key(grant.family) + ":expires",
+                subject, role, grant.family, grant.expires_at, grant.session_version,
             )
-            await self._ensure_client().expireat(self._key(digest), grant.expires_at)
-            return raw, grant
+            if not issued:
+                raise RefreshTokenReuse("Refresh token family is revoked")
+            return raw, RefreshGrant(subject, role, grant.family, int(issued), session_version)
+        except RefreshTokenReuse:
+            raise
         except Exception as exc:
             if self.settings.environment == "production":
                 raise RefreshStoreUnavailable("Refresh token service unavailable") from exc
             self._redis = None
+            if grant.family in self._families_revoked:
+                raise RefreshTokenReuse("Refresh token family is revoked") from exc
             self._memory[digest] = grant
             return raw, grant
 
@@ -105,37 +164,28 @@ class RefreshTokenStore:
         digest = self._digest(raw)
         if self.using_memory:
             grant = self._memory.pop(digest, None)
-            if digest in self._used or grant is None:
-                if digest in self._used and grant is None:
-                    family = self._used_families.get(digest)
-                    if family:
-                        self._families_revoked.add(family)
+            if grant is None:
+                used = self._used.get(digest)
+                if used is not None and used.expires_at > int(time.time()):
+                    self._families_revoked.add(used.family)
                 raise RefreshTokenReuse("Refresh token is invalid or already used")
             if grant.family in self._families_revoked or grant.expires_at <= int(time.time()):
                 raise RefreshTokenReuse("Refresh token is invalid or expired")
-            self._used.add(digest)
-            self._used_families[digest] = grant.family
-            return await self.issue(grant.subject, grant.role, grant.family, grant.session_version)
-        client = self._ensure_client()
-        try:
-            key = self._key(digest)
-            # Redis GETDEL is atomic and prevents two workers from rotating the
-            # same token concurrently.
-            values = await client.hgetall(key)
-            if not values or not await client.delete(key):
-                raise RefreshTokenReuse("Refresh token is invalid or already used")
-            if await client.exists(self._family_key(values["family"])):
-                raise RefreshTokenReuse("Refresh token family is revoked")
-            grant = RefreshGrant(
-                values["sub"],
-                values["role"],
-                values["family"],
-                int(values["exp"]),
-                int(values.get("sv", 0)),
+            self._used[digest] = grant
+            return await self.issue(
+                grant.subject, grant.role, grant.family, grant.session_version,
+                expires_at=grant.expires_at,
             )
-            if grant.expires_at <= int(time.time()):
-                raise RefreshTokenReuse("Refresh token is expired")
-            return await self.issue(grant.subject, grant.role, grant.family, grant.session_version)
+        try:
+            replacement = secrets.token_urlsafe(48)
+            values = await self._ensure_client().eval(
+                _ROTATE_SCRIPT, 2, self._key(digest), self._key(self._digest(replacement)),
+                self._family_key(""), int(time.time()),
+            )
+            if not values:
+                raise RefreshTokenReuse("Refresh token is invalid or already used")
+            grant = RefreshGrant(values[0], values[1], values[2], int(values[3]), int(values[4]))
+            return replacement, grant
         except RefreshTokenReuse:
             raise
         except Exception as exc:
