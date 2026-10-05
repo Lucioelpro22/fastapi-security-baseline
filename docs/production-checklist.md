@@ -25,6 +25,9 @@ Complete these items before the service handles real users:
 - [ ] Keep the readiness check protected from public access, or expose only non-sensitive aggregate status.
 - [ ] Require a passing readiness check in the deployment gate and retain its audit result.
 
+- [ ] Before rolling out atomic refresh rotation from older releases, drain all old workers and advance persisted account session versions; verify old access/refresh tokens return `401` and fresh login succeeds.
+- [ ] Use standalone Redis 6.2+ with Lua scripting enabled for refresh state; Redis Cluster is not supported by the current key layout.
+
 The application fails closed for unsafe production settings and for an
 unavailable production rate-limit backend. Treat either condition as a release
 block or an incident requiring investigation.

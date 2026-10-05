@@ -20,6 +20,7 @@ request bodies.
 | --- | --- | --- |
 | Password guessing | Per-client login rate limit, generic 401 responses, Argon2 hashing | Use Redis and alert on repeated failures |
 | Token forgery or replay | HS256 signature, issuer/audience/type checks, required claims, short expiry | Rotate the secret and terminate sessions when required |
+| Refresh-token replay | Atomic Redis rotation, expiring consumed-token tombstones, family revocation | Use standalone Redis 6.2+, invalidate pre-upgrade sessions, and do not mix old/new workers |
 | Cross-origin token use | Explicit `ALLOWED_ORIGINS`, credentials disabled | Keep the list small and review it per environment |
 | Configuration drift | Production validation for secrets, Redis, debug mode, and persistent DB | Inject secrets through a secret manager |
 | Redis outage bypassing controls | Production fail-closed response (503) | Monitor Redis and define an incident path |
@@ -27,7 +28,7 @@ request bodies.
 
 ## Out of scope
 
-This reference does not provide refresh-token revocation, account lockout,
+This reference does not provide account lockout,
 password reset, TLS termination, WAF protection, or a multi-tenant policy
 engine. Add those controls before exposing a real user population.
 
@@ -37,3 +38,6 @@ engine. Add those controls before exposing a real user population.
 2. Requests from an unapproved origin do not receive CORS permission.
 3. A Redis failure in production returns a controlled 503 instead of disabling the limiter.
 4. A production process cannot start with debug enabled, demo credentials, or ephemeral state.
+
+5. Reusing a consumed refresh token revokes descendants across workers; concurrent rotation yields at most one replacement, which becomes unusable after replay.
+6. Persisted account session-version changes reject old access and refresh credentials.
